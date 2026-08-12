@@ -20,16 +20,14 @@ from telegram.ext import (
 # ==================== КОНФИГУРАЦИЯ ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
-PORT = int(os.environ.get("PORT", "10000"))  # Render даёт порт через эту переменную
+PORT = int(os.environ.get("PORT", "10000"))
 
 if not BOT_TOKEN:
-    raise ValueError("❌ Переменная окружения BOT_TOKEN не установлена! Добавь её в Render Dashboard → Environment.")
+    raise ValueError("❌ Переменная окружения BOT_TOKEN не установлена!")
 
-# Настройки поиска
 SEARCH_TIMEOUT = 30
 CHECK_DELAY = 0.5
 MAX_RESULTS = 5
-
 WORD_INPUT = 1
 
 logging.basicConfig(
@@ -44,10 +42,9 @@ class UsernameChecker:
     def __init__(self):
         self.session = None
         self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.0",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.5",
-            "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
         }
 
@@ -71,7 +68,7 @@ class UsernameChecker:
 
                 banned_phrases = [
                     "this account has been deleted",
-                    "this channel has been deleted", 
+                    "this channel has been deleted",
                     "this group has been deleted",
                     "deleted account",
                     "terminated",
@@ -86,7 +83,6 @@ class UsernameChecker:
                     return {"status": "taken", "banned": False}
 
                 return {"status": "free", "banned": False}
-
         except Exception as e:
             logger.error(f"Telegram check error for @{username}: {e}")
             return {"status": "error", "banned": False}
@@ -105,7 +101,6 @@ class UsernameChecker:
                     "auction", "for sale", "buy now", "current bid",
                     "place bid", "ton", "ends in", "minimum bid", "highest bid",
                 ]
-
                 is_on_sale = any(ind in text_lower for ind in sale_indicators)
 
                 if "sold" in text_lower and not is_on_sale:
@@ -115,14 +110,12 @@ class UsernameChecker:
                     "on_sale": is_on_sale,
                     "status": "auction" if is_on_sale else "not_listed"
                 }
-
         except Exception as e:
             logger.error(f"Fragment check error for @{username}: {e}")
             return {"on_sale": False, "status": "error"}
 
     async def check_username(self, username: str) -> dict:
         await self.init_session()
-
         tg_result = await self.check_telegram(username)
         frag_result = await self.check_fragment(username)
 
@@ -286,13 +279,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "search_5":
         await query.edit_message_text(
-            "🔍 <b>Начинаю поиск 5-буквенных юзернеймов...</b>\n\n⏳ Генерация списка...", 
+            "🔍 <b>Начинаю поиск 5-буквенных юзернеймов...</b>\n\n⏳ Генерация списка...",
             parse_mode="HTML"
         )
 
         usernames = generate_letter_usernames(5, 120)
         msg = await query.edit_message_text(
-            "🔍 <b>Поиск запущен!</b>\n\n🚀 Проверяю первый юзернейм...", 
+            "🔍 <b>Поиск запущен!</b>\n\n🚀 Проверяю первый юзернейм...",
             parse_mode="HTML"
         )
 
@@ -317,13 +310,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data == "search_6":
         await query.edit_message_text(
-            "🔍 <b>Начинаю поиск 6-буквенных юзернеймов...</b>", 
+            "🔍 <b>Начинаю поиск 6-буквенных юзернеймов...</b>",
             parse_mode="HTML"
         )
 
         usernames = generate_letter_usernames(6, 120)
         msg = await query.edit_message_text(
-            "🔍 <b>Поиск запущен!</b>\n\n🚀 Проверяю первый юзернейм...", 
+            "🔍 <b>Поиск запущен!</b>\n\n🚀 Проверяю первый юзернейм...",
             parse_mode="HTML"
         )
 
@@ -427,14 +420,14 @@ async def word_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return WORD_INPUT
 
     msg = await update.message.reply_text(
-        f"🔍 <b>Ищу варианты для слова '{word}'...</b>\n\n⏳ Генерация комбинаций...", 
+        f"🔍 <b>Ищу варианты для слова '{word}'...</b>\n\n⏳ Генерация комбинаций...",
         parse_mode="HTML"
     )
 
     usernames = generate_word_variations(word)
     await msg.edit_text(
         f"🔍 <b>Поиск по слову '{word}'</b>\n\n"
-        f"🚀 Начинаю проверку <b>{len(usernames)}</b> вариантов...", 
+        f"🚀 Начинаю проверку <b>{len(usernames)}</b> вариантов...",
         parse_mode="HTML"
     )
 
@@ -469,12 +462,10 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==================== ВЕБ-СЕРВЕР (для Render Web Service) ====================
 
 async def health_check(request):
-    """Render проверяет этот URL, чтобы убедиться, что сервис живой"""
     return web.Response(text="✅ Бот работает! Username Finder Bot is alive.", status=200)
 
 
 async def run_web_server():
-    """Запускает веб-сервер для health check"""
     app = web.Application()
     app.router.add_get("/", health_check)
     runner = web.AppRunner(app)
@@ -484,10 +475,10 @@ async def run_web_server():
     logger.info(f"🌐 Веб-сервер запущен на порту {PORT}")
 
 
-# ==================== ЗАПУСК ====================
+# ==================== ЗАПУСК (python-telegram-bot v21+) ====================
 
 async def main():
-    # Запускаем веб-сервер для health check (параллельно с ботом)
+    # Запускаем веб-сервер для health check
     web_task = asyncio.create_task(run_web_server())
 
     # Настройка бота
@@ -496,7 +487,7 @@ async def main():
     word_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(button_handler, pattern="^search_word$")],
         states={
-            WORD_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, word_input_handler)],
+            WORD_INPUT: [MessageHandler(filters.TEXT & (~filters.COMMAND), word_input_handler)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
@@ -507,12 +498,12 @@ async def main():
 
     logger.info("🤖 Бот запущен! Ожидаю сообщения...")
 
-    # Запускаем polling
+    # Запускаем бота (v21+ API)
     await application.initialize()
     await application.start()
-    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
-    # Ждём вечно (или пока не нажмут Ctrl+C)
+    # Ждём вечно
     try:
         await asyncio.Event().wait()
     except (KeyboardInterrupt, SystemExit):
@@ -523,7 +514,12 @@ async def main():
         await application.shutdown()
         await checker.close()
         web_task.cancel()
+        try:
+            await web_task
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+            
