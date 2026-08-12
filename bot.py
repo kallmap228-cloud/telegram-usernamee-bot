@@ -8,611 +8,247 @@ from aiohttp import web
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-    ConversationHandler,
+    Application, CommandHandler, CallbackQueryHandler,
+    ContextTypes, MessageHandler, filters, ConversationHandler,
 )
 
-# ==================== КОНФИГУРАЦИЯ ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 PORT = int(os.environ.get("PORT", "10000"))
 
 if not BOT_TOKEN:
-    raise ValueError("❌ Переменная окружения BOT_TOKEN не установлена!")
+    raise ValueError("BOT_TOKEN not set")
 
-# НАСТРОЙКИ СКОРОСТИ
-SEARCH_TIMEOUT = 60       # Увеличили время поиска
-CHECK_DELAY = 0.15        # Задержка между БАТЧАМИ (не между проверками)
-MAX_RESULTS = 5           # Сколько результатов выдать
-BATCH_SIZE = 15           # Сколько юзернеймов проверять ПАРАЛЛЕЛЬНО одновременно
-CONCURRENT_LIMIT = 10     # Максимум одновременных HTTP-запросов
-
+SEARCH_TIMEOUT = 45
+CHECK_DELAY = 0.05
+MAX_RESULTS = 5
+BATCH_SIZE = 20
+CONCURRENT_LIMIT = 15
 WORD_INPUT = 1
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ==================== ПРОВЕРКА ЮЗЕРНЕЙМОВ (ПАРАЛЛЕЛЬНАЯ) ====================
-
-class UsernameChecker:
-    def __init__(self):
-        self.session = None
-        self.semaphore = asyncio.Semaphore(CONCURRENT_LIMIT)
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Accept-Encoding": "gzip, deflate, br",
-            "DNT": "1",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-        }
-
-    async def init_session(self):
-        if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession(headers=self.headers)
-
-    async def close(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
-
-    async def check_telegram(self, username: str) -> dict:
-        """Проверяет юзернейм через t.me — быстрая проверка"""
-        try:
-            url = f"https://t.me/{username}"
-            async with self.semaphore:
-                async with self.session.get(
-                    url, 
-                    timeout=aiohttp.ClientTimeout(total=6), 
-                    allow_redirects=True
-                ) as resp:
-                    text = await resp.text()
-                    text_lower = text.lower()
-
-                    # 404 = точно свободен
-                    if resp.status == 404:
-                        return {"status": "free", "banned": False}
-
-                    # 302 редирект = скорее всего свободен
-                    if resp.status == 302:
-                        return {"status": "free", "banned": False}
-
-                    # Проверка на забаненный/удалённый
-                    banned_phrases = [
-                        "this account has been deleted",
-                        "this channel has been deleted",
-                        "this group has been deleted",
-                        "deleted account",
-                        "terminated",
-                        "banned",
-                        "deleted user",
-                    ]
-                    is_banned = any(phrase in text_lower for phrase in banned_phrases)
-
-                    if is_banned:
-                        return {"status": "taken", "banned": True}
-
-                    # Если 200 — проверяем контент
-                    if resp.status == 200:
-                        # Признаки существующего аккаунта/канала
-                        taken_indicators = [
-                            'class="tgme_page_photo"',
-                            'class="tgme_page_title"',
-                            'class="tgme_page_description"',
-                            'class="tgme_page_extra"',
-                            'data-view="tgme_page"',
-                        ]
-
-                        # Признаки пустой/заглушечной страницы (свободен)
-                        free_indicators = [
-                            "if you have telegram, you can contact",
-                            "if you have telegram, you can view and join",
-                            "no messages here yet",
-                        ]
-
-                        is_taken = any(ind in text_lower for ind in taken_indicators)
-                        is_free_page = any(ind in text_lower for ind in free_indicators)
-
-                        if is_taken and not is_free_page:
-                            return {"status": "taken", "banned": False}
-                        else:
-                            return {"status": "free", "banned": False}
-
-                    # Любой другой статус — считаем свободным
-                    return {"status": "free", "banned": False}
-
-        except Exception as e:
-            logger.debug(f"TG check error @{username}: {e}")
-            return {"status": "error", "banned": False}
-
-    async def check_fragment(self, username: str) -> dict:
-        """Проверяет юзернейм на Fragment — быстрая проверка"""
-        try:
-            url = f"https://fragment.com/username/{username}"
-            async with self.semaphore:
-                async with self.session.get(
-                    url, 
-                    timeout=aiohttp.ClientTimeout(total=6), 
-                    allow_redirects=True
-                ) as resp:
-                    text = await resp.text()
-                    text_lower = text.lower()
-
-                    # 404 = не на продаже
-                    if resp.status == 404:
-                        return {"on_sale": False, "status": "not_listed"}
-
-                    # Быстрая проверка на аукцион
-                    sale_indicators = [
-                        "auction", "for sale", "buy now", "current bid",
-                        "place bid", "ton", "ends in", "minimum bid", 
-                        "highest bid", "collectible",
-                    ]
-
-                    is_on_sale = any(ind in text_lower for ind in sale_indicators)
-
-                    return {
-                        "on_sale": is_on_sale,
-                        "status": "auction" if is_on_sale else "not_listed"
-                    }
-
-        except Exception as e:
-            logger.debug(f"Fragment check error @{username}: {e}")
-            return {"on_sale": False, "status": "error"}
-
-    async def check_username(self, username: str) -> dict:
-        """Комплексная проверка одного юзернейма"""
-        tg_result = await self.check_telegram(username)
-
-        # Если занят в Telegram — сразу отбрасываем (не тратим время на Fragment)
-        if tg_result["status"] != "free" or tg_result["banned"]:
-            return {
-                "username": username,
-                "available": False,
-                "telegram_status": tg_result["status"],
-                "fragment_status": "skipped",
-                "banned": tg_result["banned"],
-                "on_sale": False
-            }
-
-        # Проверяем Fragment только если свободен в Telegram
-        frag_result = await self.check_fragment(username)
-
-        is_available = not frag_result["on_sale"] and not tg_result["banned"]
-
-        return {
-            "username": username,
-            "available": is_available,
-            "telegram_status": tg_result["status"],
-            "fragment_status": frag_result["status"],
-            "banned": tg_result["banned"],
-            "on_sale": frag_result["on_sale"]
-        }
-
-    async def check_batch(self, usernames: list) -> list:
-        """Проверяет список юзернеймов ПАРАЛЛЕЛЬНО"""
-        await self.init_session()
-        tasks = [self.check_username(u) for u in usernames]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Фильтруем ошибки
-        valid_results = []
-        for r in results:
-            if isinstance(r, dict):
-                valid_results.append(r)
-        return valid_results
-
-
-# ==================== ГЕНЕРАТОРЫ ====================
-
-def generate_letter_usernames(length: int, count: int = 300) -> list:
-    """Генерирует случайные юзернеймы из букв"""
-    letters = string.ascii_lowercase
-    usernames = set()
-    vowels = "aeiou"
-    consonants = "".join(c for c in letters if c not in vowels)
-
-    while len(usernames) < count:
-        if random.random() > 0.4:
-            username = "".join(random.choices(letters, k=length))
-        else:
-            username = ""
-            for i in range(length):
-                if i % 2 == 0:
-                    username += random.choice(consonants)
-                else:
-                    username += random.choice(vowels)
-
-        if len(username) >= 5 and username.isalpha():
-            usernames.add(username)
-
-    return list(usernames)
-
-
-def generate_word_variations(word: str) -> list:
-    """Генерирует варианты с префиксом и суффиксом"""
-    letters = string.ascii_lowercase
-    variations = []
-
-    # Префикс (1-2 буквы + слово)
-    for _ in range(40):
-        prefix = "".join(random.choices(letters, k=random.randint(1, 2)))
-        var = f"{prefix}{word}"
-        if 5 <= len(var) <= 32 and var.isalpha():
-            variations.append(var)
-
-    # Суффикс (слово + 1-2 буквы)
-    for _ in range(40):
-        suffix = "".join(random.choices(letters, k=random.randint(1, 2)))
-        var = f"{word}{suffix}"
-        if 5 <= len(var) <= 32 and var.isalpha() and var not in variations:
-            variations.append(var)
-
-    # Префикс + слово + суффикс
-    for _ in range(30):
-        pre = "".join(random.choices(letters, k=1))
-        suf = "".join(random.choices(letters, k=1))
-        var = f"{pre}{word}{suf}"
-        if 5 <= len(var) <= 32 and var.isalpha() and var not in variations:
-            variations.append(var)
-
-    for _ in range(20):
-        pre = "".join(random.choices(letters, k=2))
-        suf = "".join(random.choices(letters, k=2))
-        var = f"{pre}{word}{suf}"
-        if 5 <= len(var) <= 32 and var.isalpha() and var not in variations:
-            variations.append(var)
-
-    return variations[:130]
-
-
-# ==================== АНИМАЦИЯ ====================
-
-SEARCH_ANIMATIONS = [
-    "🔍 Проверяется @{username}...",
-    "⚡ Анализируется @{username}...",
-    "🔎 Сканируется @{username}...",
-    "📡 Запрос к серверам: @{username}...",
-    "🌐 Проверка Fragment: @{username}...",
-    "✨ Тестируется @{username}...",
-    "🎯 Верификация @{username}...",
-    "🛡️ Проверка бана: @{username}...",
-]
-
-async def animate_search(message, context, checker, usernames):
-    """Анимированный поиск с батчевой параллельной проверкой"""
-    start_time = datetime.now()
-    checked = 0
-    found = []
-    total = len(usernames)
-
-    # Разбиваем на батчи
-    batches = [usernames[i:i + BATCH_SIZE] for i in range(0, total, BATCH_SIZE)]
-
-    for batch in batches:
-        # Проверяем батч параллельно
-        results = await checker.check_batch(batch)
-        checked += len(batch)
-
-        for r in results:
-            if r.get("available"):
-                found.append(r)
-
-        # Обновляем сообщение каждые 2 батча
-        if checked % (BATCH_SIZE * 2) == 0 or checked == total or len(found) >= MAX_RESULTS:
-            time_elapsed = (datetime.now() - start_time).seconds
-            current = batch[-1] if batch else "..."
-            anim_text = random.choice(SEARCH_ANIMATIONS).format(username=current)
-            progress = f"
-
-📊 Проверено: {checked}/{total}
-⏱️ Прошло: {time_elapsed}с
-✅ Найдено: {len(found)}"
-            try:
-                await message.edit_text(anim_text + progress, parse_mode="HTML")
-            except Exception:
-                pass
-
-        # Если нашли достаточно — останавливаемся
-        if len(found) >= MAX_RESULTS:
-            break
-
-        # Небольшая задержка между батчами (чтобы не забанили)
-        await asyncio.sleep(CHECK_DELAY)
-
-        # Проверка таймаута
-        if (datetime.now() - start_time).seconds >= SEARCH_TIMEOUT:
-            break
-
-    return found
-
-
-# ==================== ОБРАБОТЧИКИ ====================
-
-checker = UsernameChecker()
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-
-    keyboard = [
-        [InlineKeyboardButton("🔠 Поиск 5-буквенных", callback_data="search_5")],
-        [InlineKeyboardButton("🔠 Поиск 6-буквенных", callback_data="search_6")],
-        [InlineKeyboardButton("🔤 Поиск по слову", callback_data="search_word")],
-    ]
-
-    if user.id == OWNER_ID:
-        keyboard.append([InlineKeyboardButton("⚙️ Админ-панель", callback_data="admin")])
-
-    welcome_text = (
-        f"👋 Привет, <b>{user.first_name}</b>!
-
-"
-        f"🤖 Я бот для поиска <b>свободных юзернеймов</b> Telegram.
-
-"
-        f"✨ <b>Что я проверяю:</b>
-"
-        f"  • Не занят в Telegram ✅
-"
-        f"  • Не на продаже на Fragment ✅
-"
-        f"  • Не забанен ✅
-"
-        f"  • <b>Только буквы</b>, без цифр ✅
-
-"
-        f"👇 <b>Выбери действие:</b>"
-    )
-
-    await update.message.reply_text(welcome_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
-
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "search_5":
-        await query.edit_message_text(
-            "🔍 <b>Начинаю поиск 5-буквенных юзернеймов...</b>
-
-"
-            "⏳ Генерация списка кандидатов...", 
-            parse_mode="HTML"
-        )
-
-        usernames = generate_letter_usernames(5, 300)
-        msg = await query.edit_message_text(
-            "🔍 <b>Поиск запущен!</b>
-
-"
-            "🚀 Проверяю первую партию юзернеймов...", 
-            parse_mode="HTML"
-        )
-
-        found = await animate_search(msg, context, checker, usernames)
-
-        if found:
-            text = "🎉 <b>Найдены свободные 5-буквенные юзернеймы!</b>
-
-"
-            for i, r in enumerate(found[:MAX_RESULTS], 1):
-                text += f"{i}. <code>@{r['username']}</code> ✅
-"
-            text += "
-💡 <b>Совет:</b> Проверьте их сразу — свободные короткие юзернеймы разбирают за секунды!"
-        else:
-            text = (
-                "😔 <b>Свободных 5-буквенных юзернеймов не найдено.</b>
-
-"
-                "🔄 Попробуйте ещё раз — каждый запрос генерирует новые случайные комбинации!"
-            )
-
-        keyboard = [
-            [InlineKeyboardButton("🔄 Повторить поиск", callback_data="search_5")],
-            [InlineKeyboardButton("🔙 В меню", callback_data="back")]
-        ]
-        await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
-
-    elif query.data == "search_6":
-        await query.edit_message_text(
-            "🔍 <b>Начинаю поиск 6-буквенных юзернеймов...</b>", 
-            parse_mode="HTML"
-        )
-
-        usernames = generate_letter_usernames(6, 300)
-        msg = await query.edit_message_text(
-            "🔍 <b>Поиск запущен!</b>
-
-"
-            "🚀 Проверяю первую партию юзернеймов...", 
-            parse_mode="HTML"
-        )
-
-        found = await animate_search(msg, context, checker, usernames)
-
-        if found:
-            text = "🎉 <b>Найдены свободные 6-буквенные юзернеймы!</b>
-
-"
-            for i, r in enumerate(found[:MAX_RESULTS], 1):
-                text += f"{i}. <code>@{r['username']}</code> ✅
-"
-            text += "
-💡 Проверьте их сразу!"
-        else:
-            text = (
-                "😔 <b>Свободных 6-буквенных юзернеймов не найдено.</b>
-
-"
-                "🔄 Попробуйте ещё раз!"
-            )
-
-        keyboard = [
-            [InlineKeyboardButton("🔄 Повторить поиск", callback_data="search_6")],
-            [InlineKeyboardButton("🔙 В меню", callback_data="back")]
-        ]
-        await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
-
-    elif query.data == "search_word":
-        await query.edit_message_text(
-            "🔤 <b>Поиск по слову</b>
-
-"
-            "Введите слово <b>на английском</b>, и я найду варианты с префиксом и суффиксом.
-
-"
-            "📌 <b>Пример:</b> если ввести <code>apple</code>, я найду:
-"
-            "  • <code>xaapple</code> (префикс)
-"
-            "  • <code>applexy</code> (суффикс)
-"
-            "  • <code>xappley</code> (префикс+суффикс)
-
-"
-            "📝 <b>Введите слово:</b>",
-            parse_mode="HTML"
-        )
-        return WORD_INPUT
-
-    elif query.data == "back":
-        await start_from_query(query)
-
-    elif query.data == "admin":
-        if query.from_user.id != OWNER_ID:
-            await query.answer("❌ Нет доступа!", show_alert=True)
-            return
-
-        text = (
-            "⚙️ <b>Админ-панель</b>
-
-"
-            f"👤 Владелец ID: <code>{OWNER_ID}</code>
-"
-            f"🤖 Бот работает в штатном режиме.
-
-"
-            f"📊 Здесь можно добавить:
-"
-            f"  • Статистику пользователей
-"
-            f"  • Логи проверок
-"
-            f"  • Управление подписками
-
-"
-            f"🔧 Для изменений — редактируй код в GitHub!"
-        )
-        keyboard = [[InlineKeyboardButton("🔙 В меню", callback_data="back")]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
-
-
-async def start_from_query(query):
-    keyboard = [
-        [InlineKeyboardButton("🔠 Поиск 5-буквенных", callback_data="search_5")],
-        [InlineKeyboardButton("🔠 Поиск 6-буквенных", callback_data="search_6")],
-        [InlineKeyboardButton("🔤 Поиск по слову", callback_data="search_word")],
-    ]
-    if query.from_user.id == OWNER_ID:
-        keyboard.append([InlineKeyboardButton("⚙️ Админ-панель", callback_data="admin")])
-
-    welcome_text = (
-        f"🤖 <b>Бот для поиска свободных юзернеймов</b>
-
-"
-        f"✨ <b>Возможности:</b>
-"
-        f"  • 5-буквенные юзернеймы
-"
-        f"  • 6-буквенные юзернеймы
-"
-        f"  • Поиск по слову (префикс/суффикс)
-"
-        f"  • Проверка Fragment + Telegram + Бан
-
-"
-        f"👇 <b>Выбери действие:</b>"
-    )
-    await query.edit_message_text(welcome_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
-
-
-async def word_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    word = update.message.text.strip().lower()
-
-    if not word.isalpha():
-        await update.message.reply_text(
-            "❌ <b>Ошибка!</b> Введите только буквы (a-z), без цифр, пробелов и символов!
-
-"
-            "🔄 Попробуйте снова:",
-            parse_mode="HTML"
-        )
-        return WORD_INPUT
-
-    if len(word) < 3:
-        await update.message.reply_text(
-            "❌ Слово слишком короткое! Минимум 3 буквы.
-
-"
-            "🔄 Попробуйте снова:",
-            parse_mode="HTML"
-        )
-        return WORD_INPUT
-
-    if len(word) > 20:
-        await update.message.reply_text(
-            "❌ Слово слишком длинное! Максимум 20 букв.
-
-"
-            "🔄 Попробуйте снова:",
-            parse_mode="HTML"
-        )
-        return WORD_INPUT
-
-    msg = await update.message.reply_text(
-        f"🔍 <b>Ищу варианты для слова '{word}'...</b>
-
-"
-        f"⏳ Генерация комбинаций...", 
-        parse_mode="HTML"
-    )
-
-    usernames = generate_word_variations(word)
-    await msg.edit_text(
-        f"🔍 <b>Поиск по слову '{word}'</b>
-
-"
-        f"🚀 Начинаю проверку <b>{len(usernames)}</b> вариантов...", 
-        parse_mode="HTML"
-    )
-
-    found = await animate_search(msg, context, checker, usernames)
-
-    if found:
-        text = f"🎉 <b>Найдены свободные варианты для '{word}'!</b>
-
-"
-        for i, r in enumerate(found[:MAX_RESULTS], 1):
-            text += f"{i}. <code>@{r['username']}</code> ✅
-"
-        text += "
-💡 <b>Совет:</b> Проверьте сразу — юзернеймы быстро разбирают!"
-    else:
-        text = (
-            f"😔 <b>Для слова '{word}' свободных вариантов не найдено.</b>
-
-"
-            f"🔄 Попробуйте другое слово!"
-        )
-
-    keyboard = [
-        [InlineKeyboard
+TAKEN_5 = {
+    "apple","hello","world","admin","users","tests","music","video","photo",
+    "games","sport","money","trade","crypt","block","chain","token","nfts","meta",
+    "viral","trend","style","fashi","model","actor","movie","shows","stars","space",
+    "earth","ocean","river","mount","forest","flora","fauna","plant","fruit","berry",
+    "grape","mango","lemon","melon","peach","plums","cherry","dates","olive","onion",
+    "carrot","beans","wheat","bread","pizza","pasta","sushi","steak",
+    "salad","soups","cakes","candy","sweet","sugar","honey","cream","cheese","butter",
+    "water","juice","drink","glass","bottle",
+    "table","chair","lamps","clock","watch","phone",
+    "doors","walls","roofs","floor","house","homes","rooms","yards","garden","parks",
+    "roads","paths","track","trail","drive","rides","bikes","boats","ships","plane",
+    "train","buses","taxis","truck","cargo","fleet","wheels","motor","engine","speed",
+    "quick","rapid","swift","flash","blaze","spark","flame","burns","heats",
+    "colds","snows","storm","rains","cloud","winds","sunny","light","shiny",
+    "glows","shine","glare","gleam","moons","comet","orbit",
+    "galax","nebul","quark","atoms","force","power","energy",
+    "solar","lunar","tidal","waves","sound","noisy","quiet","peace","calms",
+    "happy","smile","laugh","bliss","merry","cheer","jolly","jokes",
+    "funny","humor","comic","clown","smirk","grins","teeth","mouth","noses",
+    "faces","heads","hands","wrist","elbow","knees","ankle","heels",
+    "backs","chest","heart","brain","minds","think","knows",
+    "learn","study","teach","tutor","coach","guide","expert","maste",
+    "elite","prime","super","ultra","mega","giga","hyper","extra","grand",
+    "great","major","chief","bosss","ruler","kingg","queen",
+    "royal","crown","sword","shield","armor","knight","warrior","fight","battle","combat",
+    "siege","forts","tower","locks","keys","vault","safes",
+    "banks","chest","boxes","cases","packs","bags","sacks","trunk","crates",
+    "tools","knife","blade","razor","drill","hammer","screw","nails","bolts",
+    "wires","cords","cable","fiber","laser","radar","sonar","beacon","pulse",
+    "codes","bytes","bits","pixel","image","frame","scene","shots","clips","films",
+    "reels","tapes","discs","album","songs","lyric","verse","chorus","rhyme",
+    "beats","tempo","rhyth","dance","moves","steps","twirl","swirl","swing","salsa",
+    "tango","waltz","disco","funky","groov","jazzy","blues","rocks","metal",
+    "indie","folks","souls","gospel","choir","opera","arias","sings",
+    "vocal","voice","speak","talks","chats","texts","words","terms","names","title",
+    "label","brand","logos","marks","signs","badge","flags","posters","cards",
+    "decks","plays","rules","score","goals","wins","loses","draws",
+    "match","round","final","champ","trophy","medal","prize","award","bonus","gifts",
+    "wraps","deals","sales","shops","store","malls","market",
+    "stock","share","bonds","funds","asset","value","price","costs","rates",
+    "fees","taxes","dues","bills","coins","cents","bucks","zeros",
+    "units","items","goods","wares","stuff","thing","parts","piece","slice","chunk",
+    "block","brick","stone","rocks","gravel","soils","clays",
+    "slime","gooey","stick","glue","paste","resin","oils","fats",
+    "paint","tints","shade","hues","color","tones","pales","fades",
+    "ashes","smoke","fumes","vapor","steam","mists","foggy",
+    "dusky","dawns","dusks","noons","night","darks","black","white","grays",
+    "brown","green","blues","pinks","purpl","viole","indig","cyan","teals",
+    "amber","beige","cream","ivory","pearl","goldd","silve","bronz","coppe","rusty",
+    "iron","steel","alumin","titan","zincs","leads","nickl","cobal","chrom",
+    "silic","carbo","oxyge","nitro","hydro","heliu","neon","argon",
+    "radon","urani","pluto","radium","polon","bismo","thall","mercu",
+    "plati","palla","iridi","osmiu","rheni","tungs","tanta","hafni","zirco",
+    "yttri","scand","titani","vana","manga","ferro","nicke","coppe",
+    "galli","germa","arsen","selen","bromi","rubid","stron",
+    "niobi","molyb","techn","ruthe","rhodi","cadmi","indiu",
+    "antim","tellu","iodin","cesiu","bariu","latha","ceriu","prase",
+    "neody","prom","samar","europ","gadoli","terbi","dyspr","holmi","erbiu","thuli",
+    "ytter","lutet","reniu","bismu","polon","astat","franc","radiu","actin",
+    "thori","proto","neptu","ameri","curiu","berke","calif","einst",
+    "fermi","mende","nobel","lawre","ruther","dubni","seabo","bohri","hasse","meitn",
+    "darms","roent","copern","nihon","flero","mosco","liver","tenne","oganess",
+    "alpha","beta","gamma","delta","sigma","omega","theta","kappa","lambda",
+    "tauus","upsil","phiss","chiss","psiss","aleph","beth","gimel",
+    "dalet","heiss","zayin","chett","tettt","yoddd","kaphh","lamed",
+    "nunns","samek","ayinn","pehhh","tsade","qophh","reshe","shinn","tavvv",
+    "first","second","third","fourt","fifth","sixth","seven","eight","ninth","tenth",
+    "eleven","twelv","thirt","fifte","sixte","ninet","twent",
+    "thirt","forty","fifty","sixty","hundr","thous","milli",
+    "micro","nanoo","picoo","femto","atto","zepto","yocto","ronna","quetta",
+    "kilo","mega","giga","tera","peta","exa","zetta","yotta","bronto","geopa",
+    "monday","tuesd","wedne","thurs","frida","satur","sunda","janua","febru","march",
+    "april","mayyy","junee","jully","augus","septe","octob","novem","decem","winte",
+    "sprin","summe","autum","falls","years","month","weeks","dayss","hours","minut",
+    "secon","momen","epoch","eras","times","dates","clock","watch","timer","alarm",
+    "agess","cycle","phase","stage","steps","level","grade","rankk","class",
+    "order","group","types","kinds","sorts","forms","modes","style","ways","means",
+    "tools","aids","helps","fixes","cures","heals","mends","patch","repai","build",
+    "makes","creat","shape","molds","casts","forge","weld","glues",
+    "tapes","tacks","stitc","sewss","weave","knits","braid","plait","twist",
+    "turns","spins","rolls","loops","knots","binds","ties","wraps","folds","bends",
+    "curve","arcss","waves","swell","surge","riser","falls","drops","drips","flows",
+    "drain","pours","spill","splash","spray","shoot","burst","blast","crash","smash",
+    "break","crack","split","snaps","tears","rips","shred","chops","slices","dices",
+    "mince","grind","crush","pound","press","squeez","wring","screw","tight",
+    "loose","slack","flopp","softt","hardd","firmm","solid","stiff","rigid","tough",
+    "rough","coars","crude","rawss","plain","simpl","basic","core","basal",
+    "roots","bases","found","grund","basis","start","begin","onset","birth","origi",
+    "sourc","cause","reason","motive","drive","might","stren","vigor",
+    "energ","zestt","zeall","ardor","fervr","passi","lustt","crave","thirs","hungr",
+    "appet","taste","flavo","aroma","scent","smell","odors","reekk","stink",
+    "fragr","perfu","balms","incen","myrrh","muskk","civet","casto","beave",
+    "whale","jaspe","agate","onyxx","opall","pearls","coral",
+    "ivory","ebony","teaks","mahog","walnu","oakss","maple","birch","beech","cedar",
+    "pines","firss","spruc","hemlo","yewss","hicko","elmss","popla","willo",
+    "cypre","larch","redwo","seqou","baoba","acaci","mimos","wiste","locust","honey",
+    "cassia","senna","tamar","carob","mesqu","alder","bassw","linden","tulip","magnol",
+    "dogwo","sassa","sourr","bitte","salty","spicy","tangy","zesty","savor",
+    "tasty","yummy","delic","gourm","feast","banqu","repas","meals","lunch","dinne",
+    "break","brunc","snack","nibbl","munch","crunc","chews","gulps","swall","digest",
+    "absor","assim","metab","catab","anabo","synth","groww","devel","matu",
+    "ripen","ferme","curee","smoke","dryss","salts","pickl","canss","jars",
+    "freez","chill","cools","icess","snows","froze","glaci","polar","arctic","tundr",
+    "taiga","alpin","monta","hilly","plain","plate","basin","valle","gorge","canyo",
+    "ravine","gulch","wadii","oasis","desert","dune","sands","beach","coast","shore",
+    "cliff","bluff","crag","scree","talus","ledge","shelf","reefs","atoll","lagoo",
+    "fjord","estua","delta","marsh","swamp","mires","fens","moors","heath",
+    "meado","prair","savan","grass","herbs","shrub","bushs","trees","woods","grove",
+    "orcha","viney","field","farmm","ranch","range","graze","pastu","crop","yield",
+    "harve","reap","sowss","plant","tilll","ploug","harrow","culti","irriga","drain",
+    "ferti","manur","compo","mulch","prune","graft","buddd","layer","shoot",
+    "leave","stems","barks","twigs","branc","trunk","crowns","canop","folia","blade",
+    "petio","stalk","spike","racem","corym","umbel","head","capit","cymes","panicle",
+    "drupe","pomes","legum","grain","caryo","nutss","acorn","seeds",
+    "spore","pollen","ovule","embry","endos","peric","testa","hilum","radic","plumu",
+    "epico","hypoc","cotyl","nodes","inter","budss","axill","termi","later","adven",
+    "tapro","fibro","aerial","buttr","tubers","bulbs","corms","rhizo","stolo",
+    "runne","sucke","cutti","buddi","tissu","cultu","clone","hybri",
+    "varie","speci","genus","famil","order","phylu","kingd","domai",
+    "biome","ecosy","habit","niche","troph","produ","consum","decom","scaven","paras",
+    "symbi","mutua","commen","ammens","preda","herbi","carniv","omniv","insec","frugi",
+    "foliv","necta","polli","graniv","mollu","pisci","sangu","zooph","sapro","detri",
+    "litho","chemo","photo","auto","heter","mixo","facul","oblig","aerob","anaer",
+    "mesop","therm","psych","halop","acido","alkal","neutr","osmot","xerop","hydro",
+    "hygro","mesic","aqua","marin","terre","aeria","arbore","scans","fossor",
+    "cursor","volan","natat","amphi","crepu","diurn","noctu","cathe",
+    "vespe","matut","anthel","dawns","dusks","darkk",
+}
+
+TAKEN_6 = {
+    "google","amazon","netflix","spotify","applee","teslaa","spacex","nasa","elon","musk",
+    "donald","trump","joebiden","obama","putin","zelen","macron","merkel","boris","johnson",
+    "modi","rahul","sachin","dhoni","virat","rohit","messi","ronaldo","neymar","mbappe",
+    "lebron","jordan","kobe","curry","durant","harden","westbr","davis","gianni","luka",
+    "tatum","embiid","jokic","butler","adeba","herro","lowry","strus","vincent",
+    "martin","robinson","rubio","garlan","allen","mobley","markka","levert","osman",
+    "lopez","portis","conna","beasl","matthe","highsm",
+    "crypto","bitcoin","ethereum","solana","cardano","ripple","litecoin","dogecoin","shiba","monero",
+    "binance","coinbase","kraken","bybit","okx","kucoin","huobi","gateio","bitfin",
+    "ledger","trezor","metamask","phantom","trust","wallet","safepal","argent","rainbow","coinomi",
+    "exodus","atomic","jaxx","mycel","electrum","bitpay","brd","edge","zen","guarda",
+    "uniswap","pancake","sushi","curve","aave","compound","maker","dai","tether","usdc",
+    "usdt","busd","frax","trueusd","paxos","gemini","circle","centre","wbtc","renbtc",
+    "synthe","chainlink","band","tellor","api3","dia","nest","uma","augur","gnosis",
+    "polymarket","azuro","betfury","stake","rollbit","roobet","bcgame","bet365","pinnacle",
+    "bovada","draftkings","fanduel","betmgm","caesars","pointsbet","wynnbet","barstool","foxbet","unibet",
+    "poker","blackjack","roulette","baccarat","craps","slots","bingo","keno","lottery","raffle",
+    "jackpot","million","billion","trillion","zillion","gazillion","infinity","eternal","forever","always",
+    "never","sometimes","often","rarely","seldom","usually","frequently","occasionally","constantly","periodically",
+    "regularly","daily","weekly","monthly","yearly","hourly","nightly","annual","biweekly",
+    "fortnight","decade","century","millennium","epoch","eon","age","era","period","stage",
+    "phase","cycle","season","term","session","semester","quarter","trimester","half",
+    "whole","total","entire","complete","full","partial","incomplete","broken","damaged","destroyed",
+    "ruined","wrecked","demolished","devastated","annihilated","obliterated","eradicated","eliminated","removed","deleted",
+    "erased","wiped","cleared","cleaned","purged","flushed","drained","emptied","vacated","abandoned",
+    "deserted","forsaken","neglected","ignored","overlooked","missed","lost","found","discovered","invented",
+    "created","made","built","constructed","assembled","fabricated","manufactured","produced","generated","synthesized",
+    "composed","written","authored","penned","drafted","drawn","sketched","painted","sculpted","carved",
+    "engraved","etched","printed","published","issued","released","launched","debuted","premiered","introduced",
+    "presented","showed","displayed","exhibited","demonstrated","performed","executed","accomplished","achieved","attained",
+    "reached","obtained","acquired","gained","earned","won","secured","procured","purchased","bought",
+    "sold","traded","exchanged","bartered","swapped","transferred","shifted","moved","relocated","transported",
+    "shipped","delivered","sent","mailed","posted","dispatched","forwarded","redirected","routed","guided",
+    "led","directed","managed","controlled","regulated","governed","ruled","commanded","ordered","dictated",
+    "prescribed","recommended","suggested","advised","counseled","consulted","informed","notified","alerted","warned",
+    "cautioned","reminded","prompted","urged","encouraged","motivated","inspired","stimulated","provoked","triggered",
+    "caused","induced","forced","compelled","obliged","required","demanded","requested","asked","questioned",
+    "queried","inquired","investigated","examined","inspected","checked","verified","confirmed","validated","authenticated",
+    "certified","accredited","licensed","approved","authorized","permitted","allowed","granted","given","provided",
+    "supplied","furnished","equipped","armed","prepared","ready","set","go","start","begin",
+    "commence","initiate","originate","generate","produce","create","form","shape","mold","cast",
+    "forge","weld","solder","braze","glue","paste","tape","tack","staple","stitch",
+    "sew","weave","knit","crochet","braid","plait","twist","turn","spin","roll",
+    "loop","knot","bind","tie","wrap","fold","bend","curve","arch","wave",
+    "swell","surge","rise","fall","drop","drip","flow","stream","run","pour",
+    "spill","splash","spray","shoot","burst","blast","crash","smash","break","crack",
+    "split","snap","tear","rip","shred","chop","slice","dice","mince","grind",
+    "crush","pound","press","squeeze","wring","twist","screw","tighten","loosen","slacken",
+    "flop","soften","harden","firm","solidify","stiffen","toughen","roughen","coarsen","crudify",
+    "simplify","complicate","complexify","sophisticate","refine","purify","cleanse","clarify","filter","strain",
+    "sift","sort","classify","categorize","organize","arrange","order","systematize","structure","format",
+    "layout","design","plan","scheme","plot","diagram","chart","graph","map","model",
+    "prototype","sample","specimen","example","instance","case","illustration","demonstration","exhibition","display",
+    "show","presentation","performance","execution","accomplishment","achievement","attainment","realization","fulfillment","completion",
+    "conclusion","termination","cessation","end","finish","close","closure","ending","finale","epilogue",
+    "aftermath","consequence","result","outcome","effect","impact","influence","affect","change","alter",
+    "modify","adjust","adapt","convert","transform","transfigure","metamorphose","evolve","develop","grow",
+    "mature","ripen","age","ferment","cure","smoke","dry","salt","pickle","can",
+    "jar","bottle","freeze","chill","cool","ice","snow","frost","glaciate","polarize",
+    "magnetize","electrify","ionize","catalyze","oxidize","reduce","hydrolyze","dehydrate","hydrate","saturate",
+    "dissolve","melt","fuse","weld","solder","braze","anneal","temper","harden","quench",
+    "polish","buff","shine","gloss","glaze","varnish","lacquer","paint","stain","dye",
+    "tint","tone","shade","hue","color","pigment","dyestuff","colorant","stain","tinge",
+    "touch","trace","hint","suggestion","implication","inference","deduction","conclusion","judgment","decision",
+    "verdict","ruling","finding","determination","resolution","settlement","agreement","contract","treaty","pact",
+    "accord","concord","harmony","unity","solidarity","cohesion","adhesion","coherence","consistency","congruity",
+    "compatibility","conformity","compliance","obedience","submission","yielding","surrender","capitulation","defeat","loss",
+    "failure","deficiency","lack","absence","want","need","requirement","necessity","essential","prerequisite",
+    "condition","stipulation","provision","clause","term","article","section","paragraph","sentence","phrase",
+    "word","letter","character","symbol","sign","mark","token","emblem","badge","insignia",
+    "logo","brand","trademark","copyright","patent","license","permit","charter","franchise","concession",
+    "privilege","right","entitlement","claim","title","deed","document","record","file","dossier",
+    "archive","registry","catalog","directory","index","list","roll","roster","schedule","timetable",
+    "calendar","agenda","itinerary","program","syllabus","curriculum","course","lesson","lecture","seminar",
+    "workshop","tutorial","training","drill","exercise","practice","rehearsal","preparation","readiness","fitness",
+    "health","wellness","wholeness","soundness","strength","vigor","vitality","energy","force","power",
+    "might","potency","capacity","capability","ability","skill","talent","gift","aptitude","faculty",
+    "knack","dexterity","adroitness","deftness","proficiency","expertise","mastery","command","control","dominion",
+    "authority","jurisdiction","sway","influence","leverage","clout","pull","weight","importance","significance",
+    "consequence","moment","weightiness","gravity","seriousness","solemnity","dignity","majesty","grandeur",
+    "magnificence","splendor","glory","brilliance","radiance","luster","sheen","glow","gleam","glint",
+    "sparkle","twinkle","shimmer","glimmer","flicker","flash","flare","blaze","flame","fire",
+    "inferno","conflagration","holocaust","cataclysm","catastrophe","disaster","calamity","tragedy","misfortune","adversity",
+    "hardship","difficulty","trouble","problem","issue","matter","concern","worry","anxiety","stress",
+    "tension","pressure","strain","burden","load","weight","onus","responsibility","duty","obligation",
+    "commitment","dedication","devotion","allegiance","loyalty","fidelity","faithfulness","constancy","steadfastness","perseverance",
+    "persistence","tenacity","determination","resolve","resolution","will","volition","choice","option","alternative",
+    "possibility","probability","likelihood","chance","odds","prospect","hope","expectation","anticipation","aspiration",
+    "ambition","goal","aim","objective","target","mark","bullseye","destination","terminus","endpoint",
+    "boundary","border","frontier","limit","bounds","confines","perimeter","circumference","periphery","edge",
+    "brink","verge","threshold","doorstep","gate","portal","entrance","entry","access","admission",
+    "ingress","introduction","initiation","induction","installation","investiture","coronati
