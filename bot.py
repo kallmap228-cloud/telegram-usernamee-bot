@@ -25,9 +25,13 @@ PORT = int(os.environ.get("PORT", "10000"))
 if not BOT_TOKEN:
     raise ValueError("❌ Переменная окружения BOT_TOKEN не установлена!")
 
-SEARCH_TIMEOUT = 30
-CHECK_DELAY = 0.5
-MAX_RESULTS = 5
+# НАСТРОЙКИ СКОРОСТИ
+SEARCH_TIMEOUT = 60       # Увеличили время поиска
+CHECK_DELAY = 0.15        # Задержка между БАТЧАМИ (не между проверками)
+MAX_RESULTS = 5           # Сколько результатов выдать
+BATCH_SIZE = 15           # Сколько юзернеймов проверять ПАРАЛЛЕЛЬНО одновременно
+CONCURRENT_LIMIT = 10     # Максимум одновременных HTTP-запросов
+
 WORD_INPUT = 1
 
 logging.basicConfig(
@@ -36,16 +40,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== ПРОВЕРКА ЮЗЕРНЕЙМОВ ====================
+# ==================== ПРОВЕРКА ЮЗЕРНЕЙМОВ (ПАРАЛЛЕЛЬНАЯ) ====================
 
 class UsernameChecker:
     def __init__(self):
         self.session = None
+        self.semaphore = asyncio.Semaphore(CONCURRENT_LIMIT)
         self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
             "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
         }
 
     async def init_session(self):
@@ -57,73 +65,128 @@ class UsernameChecker:
             await self.session.close()
 
     async def check_telegram(self, username: str) -> dict:
+        """Проверяет юзернейм через t.me — быстрая проверка"""
         try:
             url = f"https://t.me/{username}"
-            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=8), allow_redirects=True) as resp:
-                text = await resp.text()
-                text_lower = text.lower()
+            async with self.semaphore:
+                async with self.session.get(
+                    url, 
+                    timeout=aiohttp.ClientTimeout(total=6), 
+                    allow_redirects=True
+                ) as resp:
+                    text = await resp.text()
+                    text_lower = text.lower()
 
-                if resp.status == 404:
-                    return {"status": "free", "banned": False}
+                    # 404 = точно свободен
+                    if resp.status == 404:
+                        return {"status": "free", "banned": False}
 
-                banned_phrases = [
-                    "this account has been deleted",
-                    "this channel has been deleted",
-                    "this group has been deleted",
-                    "deleted account",
-                    "terminated",
-                    "banned",
-                    "deleted user",
-                ]
-                is_banned = any(phrase in text_lower for phrase in banned_phrases)
+                    # 302 редирект = скорее всего свободен
+                    if resp.status == 302:
+                        return {"status": "free", "banned": False}
 
-                if resp.status == 200:
+                    # Проверка на забаненный/удалённый
+                    banned_phrases = [
+                        "this account has been deleted",
+                        "this channel has been deleted",
+                        "this group has been deleted",
+                        "deleted account",
+                        "terminated",
+                        "banned",
+                        "deleted user",
+                    ]
+                    is_banned = any(phrase in text_lower for phrase in banned_phrases)
+
                     if is_banned:
                         return {"status": "taken", "banned": True}
-                    return {"status": "taken", "banned": False}
 
-                return {"status": "free", "banned": False}
+                    # Если 200 — проверяем контент
+                    if resp.status == 200:
+                        # Признаки существующего аккаунта/канала
+                        taken_indicators = [
+                            'class="tgme_page_photo"',
+                            'class="tgme_page_title"',
+                            'class="tgme_page_description"',
+                            'class="tgme_page_extra"',
+                            'data-view="tgme_page"',
+                        ]
+
+                        # Признаки пустой/заглушечной страницы (свободен)
+                        free_indicators = [
+                            "if you have telegram, you can contact",
+                            "if you have telegram, you can view and join",
+                            "no messages here yet",
+                        ]
+
+                        is_taken = any(ind in text_lower for ind in taken_indicators)
+                        is_free_page = any(ind in text_lower for ind in free_indicators)
+
+                        if is_taken and not is_free_page:
+                            return {"status": "taken", "banned": False}
+                        else:
+                            return {"status": "free", "banned": False}
+
+                    # Любой другой статус — считаем свободным
+                    return {"status": "free", "banned": False}
+
         except Exception as e:
-            logger.error(f"Telegram check error for @{username}: {e}")
+            logger.debug(f"TG check error @{username}: {e}")
             return {"status": "error", "banned": False}
 
     async def check_fragment(self, username: str) -> dict:
+        """Проверяет юзернейм на Fragment — быстрая проверка"""
         try:
             url = f"https://fragment.com/username/{username}"
-            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=8), allow_redirects=True) as resp:
-                text = await resp.text()
-                text_lower = text.lower()
+            async with self.semaphore:
+                async with self.session.get(
+                    url, 
+                    timeout=aiohttp.ClientTimeout(total=6), 
+                    allow_redirects=True
+                ) as resp:
+                    text = await resp.text()
+                    text_lower = text.lower()
 
-                if resp.status == 404:
-                    return {"on_sale": False, "status": "not_listed"}
+                    # 404 = не на продаже
+                    if resp.status == 404:
+                        return {"on_sale": False, "status": "not_listed"}
 
-                sale_indicators = [
-                    "auction", "for sale", "buy now", "current bid",
-                    "place bid", "ton", "ends in", "minimum bid", "highest bid",
-                ]
-                is_on_sale = any(ind in text_lower for ind in sale_indicators)
+                    # Быстрая проверка на аукцион
+                    sale_indicators = [
+                        "auction", "for sale", "buy now", "current bid",
+                        "place bid", "ton", "ends in", "minimum bid", 
+                        "highest bid", "collectible",
+                    ]
 
-                if "sold" in text_lower and not is_on_sale:
-                    return {"on_sale": False, "status": "sold"}
+                    is_on_sale = any(ind in text_lower for ind in sale_indicators)
 
-                return {
-                    "on_sale": is_on_sale,
-                    "status": "auction" if is_on_sale else "not_listed"
-                }
+                    return {
+                        "on_sale": is_on_sale,
+                        "status": "auction" if is_on_sale else "not_listed"
+                    }
+
         except Exception as e:
-            logger.error(f"Fragment check error for @{username}: {e}")
+            logger.debug(f"Fragment check error @{username}: {e}")
             return {"on_sale": False, "status": "error"}
 
     async def check_username(self, username: str) -> dict:
-        await self.init_session()
+        """Комплексная проверка одного юзернейма"""
         tg_result = await self.check_telegram(username)
+
+        # Если занят в Telegram — сразу отбрасываем (не тратим время на Fragment)
+        if tg_result["status"] != "free" or tg_result["banned"]:
+            return {
+                "username": username,
+                "available": False,
+                "telegram_status": tg_result["status"],
+                "fragment_status": "skipped",
+                "banned": tg_result["banned"],
+                "on_sale": False
+            }
+
+        # Проверяем Fragment только если свободен в Telegram
         frag_result = await self.check_fragment(username)
 
-        is_available = (
-            tg_result["status"] == "free" and 
-            not frag_result["on_sale"] and
-            not tg_result["banned"]
-        )
+        is_available = not frag_result["on_sale"] and not tg_result["banned"]
 
         return {
             "username": username,
@@ -134,17 +197,31 @@ class UsernameChecker:
             "on_sale": frag_result["on_sale"]
         }
 
+    async def check_batch(self, usernames: list) -> list:
+        """Проверяет список юзернеймов ПАРАЛЛЕЛЬНО"""
+        await self.init_session()
+        tasks = [self.check_username(u) for u in usernames]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Фильтруем ошибки
+        valid_results = []
+        for r in results:
+            if isinstance(r, dict):
+                valid_results.append(r)
+        return valid_results
+
 
 # ==================== ГЕНЕРАТОРЫ ====================
 
-def generate_letter_usernames(length: int, count: int = 120) -> list:
+def generate_letter_usernames(length: int, count: int = 300) -> list:
+    """Генерирует случайные юзернеймы из букв"""
     letters = string.ascii_lowercase
     usernames = set()
     vowels = "aeiou"
     consonants = "".join(c for c in letters if c not in vowels)
 
     while len(usernames) < count:
-        if random.random() > 0.5:
+        if random.random() > 0.4:
             username = "".join(random.choices(letters, k=length))
         else:
             username = ""
@@ -161,36 +238,40 @@ def generate_letter_usernames(length: int, count: int = 120) -> list:
 
 
 def generate_word_variations(word: str) -> list:
+    """Генерирует варианты с префиксом и суффиксом"""
     letters = string.ascii_lowercase
     variations = []
 
-    for _ in range(30):
+    # Префикс (1-2 буквы + слово)
+    for _ in range(40):
         prefix = "".join(random.choices(letters, k=random.randint(1, 2)))
         var = f"{prefix}{word}"
         if 5 <= len(var) <= 32 and var.isalpha():
             variations.append(var)
 
-    for _ in range(30):
+    # Суффикс (слово + 1-2 буквы)
+    for _ in range(40):
         suffix = "".join(random.choices(letters, k=random.randint(1, 2)))
         var = f"{word}{suffix}"
         if 5 <= len(var) <= 32 and var.isalpha() and var not in variations:
             variations.append(var)
 
-    for _ in range(25):
+    # Префикс + слово + суффикс
+    for _ in range(30):
         pre = "".join(random.choices(letters, k=1))
         suf = "".join(random.choices(letters, k=1))
         var = f"{pre}{word}{suf}"
         if 5 <= len(var) <= 32 and var.isalpha() and var not in variations:
             variations.append(var)
 
-    for _ in range(15):
+    for _ in range(20):
         pre = "".join(random.choices(letters, k=2))
         suf = "".join(random.choices(letters, k=2))
         var = f"{pre}{word}{suf}"
         if 5 <= len(var) <= 32 and var.isalpha() and var not in variations:
             variations.append(var)
 
-    return variations[:100]
+    return variations[:130]
 
 
 # ==================== АНИМАЦИЯ ====================
@@ -207,38 +288,49 @@ SEARCH_ANIMATIONS = [
 ]
 
 async def animate_search(message, context, checker, usernames):
+    """Анимированный поиск с батчевой параллельной проверкой"""
     start_time = datetime.now()
     checked = 0
     found = []
-    current_idx = 0
-    last_update = 0
+    total = len(usernames)
 
-    while (datetime.now() - start_time).seconds < SEARCH_TIMEOUT:
-        if current_idx >= len(usernames):
-            break
+    # Разбиваем на батчи
+    batches = [usernames[i:i + BATCH_SIZE] for i in range(0, total, BATCH_SIZE)]
 
-        username = usernames[current_idx]
-        checked += 1
+    for batch in batches:
+        # Проверяем батч параллельно
+        results = await checker.check_batch(batch)
+        checked += len(batch)
 
-        time_elapsed = (datetime.now() - start_time).seconds
-        if checked % 3 == 0 or (time_elapsed - last_update) >= 3:
-            last_update = time_elapsed
-            anim_text = random.choice(SEARCH_ANIMATIONS).format(username=username)
-            progress = f"\n\n📊 Проверено: {checked}/{len(usernames)}\n⏱️ Прошло: {time_elapsed}с\n✅ Найдено: {len(found)}"
+        for r in results:
+            if r.get("available"):
+                found.append(r)
+
+        # Обновляем сообщение каждые 2 батча
+        if checked % (BATCH_SIZE * 2) == 0 or checked == total or len(found) >= MAX_RESULTS:
+            time_elapsed = (datetime.now() - start_time).seconds
+            current = batch[-1] if batch else "..."
+            anim_text = random.choice(SEARCH_ANIMATIONS).format(username=current)
+            progress = f"
+
+📊 Проверено: {checked}/{total}
+⏱️ Прошло: {time_elapsed}с
+✅ Найдено: {len(found)}"
             try:
                 await message.edit_text(anim_text + progress, parse_mode="HTML")
             except Exception:
                 pass
 
-        result = await checker.check_username(username)
+        # Если нашли достаточно — останавливаемся
+        if len(found) >= MAX_RESULTS:
+            break
 
-        if result["available"]:
-            found.append(result)
-            if len(found) >= MAX_RESULTS:
-                break
-
-        current_idx += 1
+        # Небольшая задержка между батчами (чтобы не забанили)
         await asyncio.sleep(CHECK_DELAY)
+
+        # Проверка таймаута
+        if (datetime.now() - start_time).seconds >= SEARCH_TIMEOUT:
+            break
 
     return found
 
@@ -260,13 +352,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton("⚙️ Админ-панель", callback_data="admin")])
 
     welcome_text = (
-        f"👋 Привет, <b>{user.first_name}</b>!\n\n"
-        f"🤖 Я бот для поиска <b>свободных юзернеймов</b> Telegram.\n\n"
-        f"✨ <b>Что я проверяю:</b>\n"
-        f"  • Не занят в Telegram ✅\n"
-        f"  • Не на продаже на Fragment ✅\n"
-        f"  • Не забанен ✅\n"
-        f"  • <b>Только буквы</b>, без цифр ✅\n\n"
+        f"👋 Привет, <b>{user.first_name}</b>!
+
+"
+        f"🤖 Я бот для поиска <b>свободных юзернеймов</b> Telegram.
+
+"
+        f"✨ <b>Что я проверяю:</b>
+"
+        f"  • Не занят в Telegram ✅
+"
+        f"  • Не на продаже на Fragment ✅
+"
+        f"  • Не забанен ✅
+"
+        f"  • <b>Только буквы</b>, без цифр ✅
+
+"
         f"👇 <b>Выбери действие:</b>"
     )
 
@@ -279,26 +381,38 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "search_5":
         await query.edit_message_text(
-            "🔍 <b>Начинаю поиск 5-буквенных юзернеймов...</b>\n\n⏳ Генерация списка...",
+            "🔍 <b>Начинаю поиск 5-буквенных юзернеймов...</b>
+
+"
+            "⏳ Генерация списка кандидатов...", 
             parse_mode="HTML"
         )
 
-        usernames = generate_letter_usernames(5, 120)
+        usernames = generate_letter_usernames(5, 300)
         msg = await query.edit_message_text(
-            "🔍 <b>Поиск запущен!</b>\n\n🚀 Проверяю первый юзернейм...",
+            "🔍 <b>Поиск запущен!</b>
+
+"
+            "🚀 Проверяю первую партию юзернеймов...", 
             parse_mode="HTML"
         )
 
         found = await animate_search(msg, context, checker, usernames)
 
         if found:
-            text = "🎉 <b>Найдены свободные 5-буквенные юзернеймы!</b>\n\n"
+            text = "🎉 <b>Найдены свободные 5-буквенные юзернеймы!</b>
+
+"
             for i, r in enumerate(found[:MAX_RESULTS], 1):
-                text += f"{i}. <code>@{r['username']}</code> ✅\n"
-            text += "\n💡 <b>Совет:</b> Проверьте их сразу — свободные короткие юзернеймы разбирают за секунды!"
+                text += f"{i}. <code>@{r['username']}</code> ✅
+"
+            text += "
+💡 <b>Совет:</b> Проверьте их сразу — свободные короткие юзернеймы разбирают за секунды!"
         else:
             text = (
-                "😔 <b>Свободных 5-буквенных юзернеймов не найдено.</b>\n\n"
+                "😔 <b>Свободных 5-буквенных юзернеймов не найдено.</b>
+
+"
                 "🔄 Попробуйте ещё раз — каждый запрос генерирует новые случайные комбинации!"
             )
 
@@ -310,26 +424,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data == "search_6":
         await query.edit_message_text(
-            "🔍 <b>Начинаю поиск 6-буквенных юзернеймов...</b>",
+            "🔍 <b>Начинаю поиск 6-буквенных юзернеймов...</b>", 
             parse_mode="HTML"
         )
 
-        usernames = generate_letter_usernames(6, 120)
+        usernames = generate_letter_usernames(6, 300)
         msg = await query.edit_message_text(
-            "🔍 <b>Поиск запущен!</b>\n\n🚀 Проверяю первый юзернейм...",
+            "🔍 <b>Поиск запущен!</b>
+
+"
+            "🚀 Проверяю первую партию юзернеймов...", 
             parse_mode="HTML"
         )
 
         found = await animate_search(msg, context, checker, usernames)
 
         if found:
-            text = "🎉 <b>Найдены свободные 6-буквенные юзернеймы!</b>\n\n"
+            text = "🎉 <b>Найдены свободные 6-буквенные юзернеймы!</b>
+
+"
             for i, r in enumerate(found[:MAX_RESULTS], 1):
-                text += f"{i}. <code>@{r['username']}</code> ✅\n"
-            text += "\n💡 Проверьте их сразу!"
+                text += f"{i}. <code>@{r['username']}</code> ✅
+"
+            text += "
+💡 Проверьте их сразу!"
         else:
             text = (
-                "😔 <b>Свободных 6-буквенных юзернеймов не найдено.</b>\n\n"
+                "😔 <b>Свободных 6-буквенных юзернеймов не найдено.</b>
+
+"
                 "🔄 Попробуйте ещё раз!"
             )
 
@@ -341,12 +464,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data == "search_word":
         await query.edit_message_text(
-            "🔤 <b>Поиск по слову</b>\n\n"
-            "Введите слово <b>на английском</b>, и я найду варианты с префиксом и суффиксом.\n\n"
-            "📌 <b>Пример:</b> если ввести <code>apple</code>, я найду:\n"
-            "  • <code>xaapple</code> (префикс)\n"
-            "  • <code>applexy</code> (суффикс)\n"
-            "  • <code>xappley</code> (префикс+суффикс)\n\n"
+            "🔤 <b>Поиск по слову</b>
+
+"
+            "Введите слово <b>на английском</b>, и я найду варианты с префиксом и суффиксом.
+
+"
+            "📌 <b>Пример:</b> если ввести <code>apple</code>, я найду:
+"
+            "  • <code>xaapple</code> (префикс)
+"
+            "  • <code>applexy</code> (суффикс)
+"
+            "  • <code>xappley</code> (префикс+суффикс)
+
+"
             "📝 <b>Введите слово:</b>",
             parse_mode="HTML"
         )
@@ -361,13 +493,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         text = (
-            "⚙️ <b>Админ-панель</b>\n\n"
-            f"👤 Владелец ID: <code>{OWNER_ID}</code>\n"
-            f"🤖 Бот работает в штатном режиме.\n\n"
-            f"📊 Здесь можно добавить:\n"
-            f"  • Статистику пользователей\n"
-            f"  • Логи проверок\n"
-            f"  • Управление подписками\n\n"
+            "⚙️ <b>Админ-панель</b>
+
+"
+            f"👤 Владелец ID: <code>{OWNER_ID}</code>
+"
+            f"🤖 Бот работает в штатном режиме.
+
+"
+            f"📊 Здесь можно добавить:
+"
+            f"  • Статистику пользователей
+"
+            f"  • Логи проверок
+"
+            f"  • Управление подписками
+
+"
             f"🔧 Для изменений — редактируй код в GitHub!"
         )
         keyboard = [[InlineKeyboardButton("🔙 В меню", callback_data="back")]]
@@ -384,12 +526,20 @@ async def start_from_query(query):
         keyboard.append([InlineKeyboardButton("⚙️ Админ-панель", callback_data="admin")])
 
     welcome_text = (
-        f"🤖 <b>Бот для поиска свободных юзернеймов</b>\n\n"
-        f"✨ <b>Возможности:</b>\n"
-        f"  • 5-буквенные юзернеймы\n"
-        f"  • 6-буквенные юзернеймы\n"
-        f"  • Поиск по слову (префикс/суффикс)\n"
-        f"  • Проверка Fragment + Telegram + Бан\n\n"
+        f"🤖 <b>Бот для поиска свободных юзернеймов</b>
+
+"
+        f"✨ <b>Возможности:</b>
+"
+        f"  • 5-буквенные юзернеймы
+"
+        f"  • 6-буквенные юзернеймы
+"
+        f"  • Поиск по слову (префикс/суффикс)
+"
+        f"  • Проверка Fragment + Telegram + Бан
+
+"
         f"👇 <b>Выбери действие:</b>"
     )
     await query.edit_message_text(welcome_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
@@ -400,126 +550,69 @@ async def word_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if not word.isalpha():
         await update.message.reply_text(
-            "❌ <b>Ошибка!</b> Введите только буквы (a-z), без цифр, пробелов и символов!\n\n🔄 Попробуйте снова:",
+            "❌ <b>Ошибка!</b> Введите только буквы (a-z), без цифр, пробелов и символов!
+
+"
+            "🔄 Попробуйте снова:",
             parse_mode="HTML"
         )
         return WORD_INPUT
 
     if len(word) < 3:
         await update.message.reply_text(
-            "❌ Слово слишком короткое! Минимум 3 буквы.\n\n🔄 Попробуйте снова:",
+            "❌ Слово слишком короткое! Минимум 3 буквы.
+
+"
+            "🔄 Попробуйте снова:",
             parse_mode="HTML"
         )
         return WORD_INPUT
 
     if len(word) > 20:
         await update.message.reply_text(
-            "❌ Слово слишком длинное! Максимум 20 букв.\n\n🔄 Попробуйте снова:",
+            "❌ Слово слишком длинное! Максимум 20 букв.
+
+"
+            "🔄 Попробуйте снова:",
             parse_mode="HTML"
         )
         return WORD_INPUT
 
     msg = await update.message.reply_text(
-        f"🔍 <b>Ищу варианты для слова '{word}'...</b>\n\n⏳ Генерация комбинаций...",
+        f"🔍 <b>Ищу варианты для слова '{word}'...</b>
+
+"
+        f"⏳ Генерация комбинаций...", 
         parse_mode="HTML"
     )
 
     usernames = generate_word_variations(word)
     await msg.edit_text(
-        f"🔍 <b>Поиск по слову '{word}'</b>\n\n"
-        f"🚀 Начинаю проверку <b>{len(usernames)}</b> вариантов...",
+        f"🔍 <b>Поиск по слову '{word}'</b>
+
+"
+        f"🚀 Начинаю проверку <b>{len(usernames)}</b> вариантов...", 
         parse_mode="HTML"
     )
 
     found = await animate_search(msg, context, checker, usernames)
 
     if found:
-        text = f"🎉 <b>Найдены свободные варианты для '{word}'!</b>\n\n"
+        text = f"🎉 <b>Найдены свободные варианты для '{word}'!</b>
+
+"
         for i, r in enumerate(found[:MAX_RESULTS], 1):
-            text += f"{i}. <code>@{r['username']}</code> ✅\n"
-        text += "\n💡 <b>Совет:</b> Проверьте сразу — юзернеймы быстро разбирают!"
+            text += f"{i}. <code>@{r['username']}</code> ✅
+"
+        text += "
+💡 <b>Совет:</b> Проверьте сразу — юзернеймы быстро разбирают!"
     else:
         text = (
-            f"😔 <b>Для слова '{word}' свободных вариантов не найдено.</b>\n\n"
+            f"😔 <b>Для слова '{word}' свободных вариантов не найдено.</b>
+
+"
             f"🔄 Попробуйте другое слово!"
         )
 
     keyboard = [
-        [InlineKeyboardButton("🔤 Новое слово", callback_data="search_word")],
-        [InlineKeyboardButton("🔙 В меню", callback_data="back")]
-    ]
-    await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
-
-    return ConversationHandler.END
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Отменено. Возвращаюсь в меню...")
-    await start(update, context)
-    return ConversationHandler.END
-
-
-# ==================== ВЕБ-СЕРВЕР (для Render Web Service) ====================
-
-async def health_check(request):
-    return web.Response(text="✅ Бот работает! Username Finder Bot is alive.", status=200)
-
-
-async def run_web_server():
-    app = web.Application()
-    app.router.add_get("/", health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logger.info(f"🌐 Веб-сервер запущен на порту {PORT}")
-
-
-# ==================== ЗАПУСК (python-telegram-bot v21+) ====================
-
-async def main():
-    # Запускаем веб-сервер для health check
-    web_task = asyncio.create_task(run_web_server())
-
-    # Настройка бота
-    application = Application.builder().token(BOT_TOKEN).build()
-
-    word_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_handler, pattern="^search_word$")],
-        states={
-            WORD_INPUT: [MessageHandler(filters.TEXT & (~filters.COMMAND), word_input_handler)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(word_conv)
-    application.add_handler(CallbackQueryHandler(button_handler))
-
-    logger.info("🤖 Бот запущен! Ожидаю сообщения...")
-
-    # Запускаем бота (v21+ API)
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-
-    # Ждём вечно
-    try:
-        await asyncio.Event().wait()
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("🛑 Остановка бота...")
-    finally:
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
-        await checker.close()
-        web_task.cancel()
-        try:
-            await web_task
-        except asyncio.CancelledError:
-            pass
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-            
+        [InlineKeyboard
